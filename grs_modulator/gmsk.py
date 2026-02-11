@@ -1,28 +1,28 @@
 #
 #  gmsk.py
 #
-#  Copyright The SpaceLab-Transmitter Contributors.
+#  Copyright The GRS Demodulator Contributors.
 #
-#  This file is part of SpaceLab-Transmitter.
+#  This file is part of GRS Demodulator.
 #
-#  SpaceLab-Transmitter is free software; you can redistribute it
+#  GRS Demodulator is free software; you can redistribute it
 #  and/or modify it under the terms of the GNU General Public License as
 #  published by the Free Software Foundation, either version 3 of the
 #  License, or (at your option) any later version.
 #
-#  SpaceLab-Transmitter is distributed in the hope that it will be useful,
+#  GRS Demodulator is distributed in the hope that it will be useful,
 #  but WITHOUT ANY WARRANTY; without even the implied warranty of
 #  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #  GNU General Public License for more details.
 #
 #  You should have received a copy of the GNU General Public
-#  License along with SpaceLab-Transmitter; if not, see <http://www.gnu.org/licenses/>.
+#  License along with GRS Demodulator; if not, see <http://www.gnu.org/licenses/>.
 #
 #
-
 
 import numpy as np
-from scipy.signal import upfirdn, lfilter
+from scipy.signal import upfirdn, lfilter, butter
+from .timing_sync.timing_sync import TimeSync
 
 _GMSK_DEFAULT_OVERSAMPLING_FACTOR = 100
 
@@ -136,6 +136,16 @@ class GMSK:
         h = B*np.sqrt(2*np.pi/(np.log(2)))*np.exp(-2 * (t*np.pi*B)**2 /(np.log(2)))
         h_norm = h / np.sum(h)
         return h_norm
+    
+    def _low_pass_filter(self, iq_samples, fs, cutoff):
+        nyq = 0.5 * fs
+        normal_cutoff = cutoff / nyq
+        
+        # 5th order Butterworth filter
+        b, a = butter(5, normal_cutoff, btype='low', analog=False)
+        
+        # Apply filter to the complex samples
+        return lfilter(b, a, iq_samples)
 
     def _int_list_to_bit_list(self, n):
         """
@@ -162,21 +172,29 @@ class GMSK:
         :return res: TODO
         """
         sps = int(fs/self._baudrate)
+        
+        # Apply low pass filter
+        cutoff_freq = 1.5 * self._baudrate
+        low_pass_iq = self._low_pass_filter(iq_samples, fs, cutoff_freq)
 
         # Frequency discriminator
-        freq_deviation = self._frequency_discriminator(iq_samples)
+        freq_deviation = self._frequency_discriminator(low_pass_iq)
 
         # Apply Gaussian matched filter
-        gaussian_filter = self._gaussian_filter(3 * sps, sps)
+        gaussian_filter = self._gaussian_filter(sps, span = 1, bt = 2)
         filtered_signal = np.convolve(freq_deviation, gaussian_filter, mode='same')
 
-        # Downsample to symbol rate
-        sampled_signal = filtered_signal[sps // 2 :: sps]
-
+        # Normalization
+        filtered_signal = self._normalize(filtered_signal)
+        
+        # Timing recovery
+        time_sync = TimeSync(samp_rate=fs, baud=self._baudrate)
+        soft_symbols = np.array(time_sync.get_bitstream(filtered_signal))
+                
         # Decision thresholding
-        demodulated_bits = (sampled_signal > 0).astype(int)
-
-        return list(demodulated_bits), sampled_signal
+        demod_bits = (soft_symbols > 0).astype(int)
+        
+        return list(demod_bits), soft_symbols, filtered_signal
 
     def _frequency_discriminator(self, iq_samples):
         """
@@ -192,16 +210,49 @@ class GMSK:
 
         return np.concatenate([[0], freq_deviation])    # Keep length consistent
 
-    def _gaussian_filter(self, L, sps):
+    def _gaussian_filter(self, sps, span, bt):
         """
         Generate a Gaussian matched filter.
 
-        :param L: TODO
+        :param span: TODO
 
         :return res: TODO
         """
-        alpha = np.sqrt(np.log(2)) / (self._bt * sps)
-        t = np.arange(-L, L + 1)
-        g = np.exp(-0.5 * (alpha * t) ** 2)
+        _bt = self._bt if bt is None else bt
+        
+        t = np.arange(-span*sps, span*sps + 1)
+        alpha = (2 * np.pi * _bt) / (np.sqrt(np.log(2)) * sps)        
+        h = np.exp(-0.5 * (alpha * t) ** 2)
+        return h / np.sum(h)
+    
+    def _bit_list_to_int_list(self, b):
+        """
+        Converts a list of bits to a list of integers (bytes)
+        
+        :param b: The list of bits
+        :return res: The list of integers for the given list of bits
+        """
+    
+        return [int("".join(map(str, b[i:i+8])), 2) for i in range(0, len(b), 8)]
+    
+    def _normalize(self, x):
+        """
+        Normalizes sample
+        """
+        x = x - np.mean(x)
+        s = np.std(x)
+        if s != 0:
+            return x/s
+        return x
+    
+    def _remove_matched_filter_delay(self, x, sps, span):
+        """
+        Removes group delay introduced by the Gaussian matched filter.
+        """
+        delay = span * sps
+        if len(x) <= 2 * delay:
+            return x
+        return x[delay:-delay]
 
-        return g / np.sum(g)
+
+    
